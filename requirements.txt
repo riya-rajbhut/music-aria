@@ -1,0 +1,12 @@
+# Kaggle already provides GPU-enabled PyTorch, torchvision and torchaudio.
+# Keep this file limited to project packages that are typically missing there.
+# If you run locally, install a matching PyTorch build separately for your CUDA/CPU setup.
+
+numpy>=1.26,<3
+pandas>=2.2,<3
+pretty_midi==0.2.10
+matplotlib>=3.8,<4
+torch>=2.0.0,<3
+torchvision>=0.15.0,<1
+torchaudio>=2.0.0,<3
+wandb>=0.15,<1
