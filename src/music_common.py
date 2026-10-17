@@ -247,7 +247,7 @@ class ShardedSampler(data.Sampler):
     shuffle=False + drop_last=False gives an exact (un-padded) evaluation shard."""
 
     def __init__(self, n, rank, world, shuffle, seed=0, drop_last=False):
-        super().__init__(None)
+        # no super().__init__(): Sampler.__init__ changed across torch versions (newer ones have none)
         self.n, self.rank, self.world = int(n), rank, world
         self.shuffle, self.seed, self.drop_last = shuffle, seed, drop_last
         self.epoch, self.skip = 0, 0
@@ -593,9 +593,9 @@ def evaluate(raw_model, loader, device):
 # =============================================================================
 
 def init_dist(rank, world, timeout_hours=2):
+    torch.cuda.set_device(rank)                      # before init: avoids the NCCL rank->GPU mapping warning
     dist.init_process_group("nccl", init_method="env://", world_size=world, rank=rank,
                             timeout=timedelta(hours=timeout_hours))
-    torch.cuda.set_device(rank)
 
 
 def lr_at(peak, step, warmup_steps, progress, min_ratio):
@@ -638,9 +638,6 @@ class Logger:
             return
         try:
             import wandb
-            import os
-            from kaggle_secrets import UserSecretsClient
-            os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
             key = os.environ.get("WANDB_API_KEY")
             if key:
                 wandb.login(key=key)
