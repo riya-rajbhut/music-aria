@@ -638,15 +638,13 @@ class Logger:
             return
         try:
             import wandb
-            key = "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"
-
-            wandb.login(key=key)
-            
-            wandb.init(
-                project="music-rnn-ddp",
-                entity="riya-rajbhut-student",
-                config=hparams
-            )
+            import os
+            from kaggle_secrets import UserSecretsClient
+            os.environ["WANDB_API_KEY"] = UserSecretsClient().get_secret("WANDB_API_KEY")
+            key = os.environ.get("WANDB_API_KEY")
+            if key:
+                wandb.login(key=key)
+            self.run = wandb.init(**init_kwargs)
             self._wandb, self.run_id = wandb, self.run.id
         except Exception as e:  # noqa: BLE001
             print(f"[wandb disabled] {e}", flush=True)
