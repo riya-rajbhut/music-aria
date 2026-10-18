@@ -29,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from music_common import (Logger, ShardedSampler, TypeStats, WindowDataset, add_model_args, assert_grammar,
                           build_model, cfg_from_args, count_params, evaluate, flatten_summary, format_summary,
-                          init_dist, load_corpus, lr_at, make_optimizer, masked_ce, save_atomic)
+                          init_dist, load_corpus, load_weights, lr_at, make_optimizer, masked_ce, save_atomic)
 
 
 def parse_args():
@@ -61,6 +61,11 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--max_steps", type=int, default=0, help="debug: stop after N steps (0 = off)")
     p.add_argument("--fresh", action="store_true", help="ignore an existing pretrain_last.pt")
+    p.add_argument("--init_ckpt", default="", help="start from these backbone weights (model + config) with a "
+                   "NEW optimizer/schedule, e.g. to continue pretraining or extend the context window")
+    p.add_argument("--run_name", default="aria-pretrain", help="W&B run name")
+    p.add_argument("--artifact_prefix", default="aria_pretrained",
+                   help="names of saved files / W&B artifacts: <prefix>_best, <prefix>_backbone")
     p.add_argument("--seed", type=int, default=53)
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_project", default="music-rnn-ddp")
@@ -113,9 +118,15 @@ def main_worker(rank, world, args):
                                  sampler=ShardedSampler(len(val_ds), rank, world, shuffle=False), pin_memory=True)
 
     # ------------------------------------------------------------------ model / optimiser
-    cfg = cfg_from_args(args)
+    init_ck = torch.load(args.init_ckpt, map_location="cpu", weights_only=True) if args.init_ckpt else None
+    cfg = init_ck["model_cfg"] if init_ck else cfg_from_args(args)
     torch.manual_seed(args.seed)                                   # identical init on every rank
     raw = build_model(cfg, dropout=args.dropout, grad_checkpoint=args.grad_checkpoint).to(device)
+    if init_ck is not None:
+        load_weights(raw, init_ck["model_state_dict"])
+        if is_main:
+            print(f"initialised from {args.init_ckpt} | meta {init_ck.get('meta')}", flush=True)
+        del init_ck
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
     np.random.seed(args.seed + rank)
@@ -139,7 +150,7 @@ def main_worker(rank, world, args):
         print(f"model: {count_params(raw) / 1e6:.1f}M params | cfg {cfg}", flush=True)
 
     logger = Logger(is_main and not args.no_wandb, project=args.wandb_project, entity=args.wandb_entity,
-                    name="aria-pretrain", config=vars(args), id=state["wandb_id"], resume="allow")
+                    name=args.run_name, config=vars(args), id=state["wandb_id"], resume="allow")
     if is_main:
         state["wandb_id"] = logger.run_id
 
@@ -242,9 +253,9 @@ def main_worker(rank, world, args):
                     logger.log(flatten_summary("val", res), step=step)
                     if res["nll"] < state["best"]:
                         state["best"] = res["nll"]
-                        save_backbone(out_dir / "aria_pretrained_best.pt", res)
+                        save_backbone(out_dir / f"{args.artifact_prefix}_best.pt", res)
                         if (time.time() - state["last_upload"]) / 60 >= args.upload_every_min:
-                            logger.log_model(out_dir / "aria_pretrained_best.pt", "aria_pretrained_best",
+                            logger.log_model(out_dir / f"{args.artifact_prefix}_best.pt", f"{args.artifact_prefix}_best",
                                              dict(step=step, val_ppl=res["ppl"]))
                             state["last_upload"] = time.time()
                 t_log = time.time()
@@ -268,9 +279,9 @@ def main_worker(rank, world, args):
     if is_main:
         print(f"[final] step {step} | VAL {format_summary(res)}", flush=True)
         logger.log(flatten_summary("val", res), step=step)
-        final_path = out_dir / "aria_pretrained_backbone.pt"
+        final_path = out_dir / f"{args.artifact_prefix}_backbone.pt"
         save_backbone(final_path, res)
-        logger.log_model(final_path, "aria_pretrained_backbone", dict(step=step, val_ppl=res["ppl"], cfg=cfg))
+        logger.log_model(final_path, f"{args.artifact_prefix}_backbone", dict(step=step, val_ppl=res["ppl"], cfg=cfg))
         state["finished"] = True
         save_last()
         logger.summary({"final/val_ppl": res["ppl"], "final/val_acc": res["acc"], "final/steps": step})
