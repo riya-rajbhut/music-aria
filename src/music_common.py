@@ -179,6 +179,21 @@ def fingerprint(tokens: np.ndarray) -> np.ndarray:
 # 3. DATASETS / SAMPLERS
 # =============================================================================
 
+TIME_STRETCH_FACTORS = (0.95, 0.975, 1.0, 1.025, 1.05)     # same set as the MAESTRO paper
+
+
+def stretch_ticks(a, f):
+    """Time-stretch augmentation on a token array (numpy int64): rescale every time_shift and duration value by f.
+    Zero shifts stay zero (chords stay chords). Values are already quantised to 1/32 s, so this is an approximate
+    augmentation: small tick values barely change, large ones move by up to ~5 %."""
+    out = a.copy()
+    sh = (a >= 128) & (a < 256)
+    du = a >= 256
+    out[sh] = 128 + np.clip(np.rint((a[sh] - 128) * f), 0, MAX_TICKS).astype(np.int64)
+    out[du] = 256 + np.clip(np.rint((a[du] - 256) * f), 1, MAX_TICKS).astype(np.int64)
+    return out
+
+
 class WindowDataset(data.Dataset):
     """
     Fixed-length windows over a flat uint16 token array (np.ndarray or np.memmap) + song offsets.
@@ -190,10 +205,10 @@ class WindowDataset(data.Dataset):
     """
 
     def __init__(self, tokens, offsets, song_ids, seq_len, hop, jitter=False, transpose=0,
-                 max_windows=None, subsample_seed=0):
+                 max_windows=None, subsample_seed=0, time_stretch=False):
         assert hop % 3 == 0 and seq_len % 3 == 0, "seq_len and hop must be multiples of 3"
         self.tokens, self.seq_len, self.hop = tokens, seq_len, hop
-        self.jitter, self.transpose = jitter, transpose
+        self.jitter, self.transpose, self.time_stretch = jitter, transpose, time_stretch
         song_ids = np.asarray(song_ids, dtype=np.int64)
         lens = offsets[song_ids + 1] - offsets[song_ids]
         ok = lens >= seq_len + 3
@@ -222,8 +237,10 @@ class WindowDataset(data.Dataset):
             rel = min(rel + 3 * random.randrange(self.hop // 3), int(self.max_rel[k]))
         start = int(self.song_start[k]) + rel
         pre = 2 if rel >= 3 else 0            # previous note's pitch token sits at rel-2
-        chunk = torch.from_numpy(np.asarray(self.tokens[start - pre: start + self.seq_len + 1],
-                                            dtype=np.int64).copy())
+        arr = np.array(self.tokens[start - pre: start + self.seq_len + 1], dtype=np.int64)
+        if self.time_stretch:
+            arr = stretch_ticks(arr, random.choice(TIME_STRETCH_FACTORS))
+        chunk = torch.from_numpy(arr)
         if self.transpose:
             shift = random.randint(-self.transpose, self.transpose)
             if shift != 0:
@@ -327,9 +344,13 @@ class MusicRoPE(nn.Module):
         return tuple(d for d in self.dims if d > 0)
 
     def build(self, tokens, pitch_seq):
-        B, S = tokens.shape
-        pos = (musical_ticks(tokens).float(), pitch_seq.float(),
-               torch.arange(S, device=tokens.device, dtype=torch.float32).expand(B, S))
+        return self.build_positions(musical_ticks(tokens), pitch_seq)
+
+    def build_positions(self, ticks, pitch_seq):
+        """ticks / pitch_seq: (B,S) musical time (ticks) and pitch of every position."""
+        B, S = pitch_seq.shape
+        pos = (ticks.float(), pitch_seq.float(),
+               torch.arange(S, device=pitch_seq.device, dtype=torch.float32).expand(B, S))
         cs = []
         for i, p in enumerate(pos):
             if self.dims[i] == 0:
