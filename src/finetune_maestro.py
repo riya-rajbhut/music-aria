@@ -61,6 +61,12 @@ def parse_args():
     p.add_argument("--clip", type=float, default=0.5)
     p.add_argument("--contrastive_weight", type=float, default=0.0, help="optional CPC aux loss (0 = off)")
     p.add_argument("--cpc_ks", type=str, default="3,6")
+    # [CHANGED] tolerance metric / pitch-focused objective
+    p.add_argument("--time_tol", type=int, default=3,
+                   help="shift/duration count as correct within +-this many ticks (1 tick = 1/32 s; 3 ~ 94 ms). 0 = exact")
+    p.add_argument("--pitch_w", type=float, default=1.0, help="loss weight on pitch targets")
+    p.add_argument("--tol_loss", action="store_true",
+                   help="train shift/duration with -log P(within +-time_tol ticks) instead of exact-tick CE")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--resume", action="store_true")
@@ -76,6 +82,10 @@ def parse_args():
 
 def main_worker(rank, world, args):
     init_dist(rank, world)
+    import music_common as mc                        # [CHANGED] pass the tolerance settings into music_common
+    mc.TIME_TOL, mc.PITCH_W, mc.TOL_LOSS = args.time_tol, args.pitch_w, args.tol_loss
+    if rank == 0:
+        print(f"time_tol={mc.TIME_TOL} ticks, pitch_w={mc.PITCH_W}, tol_loss={mc.TOL_LOSS}", flush=True)
     device = torch.device(f"cuda:{rank}")
     is_main = rank == 0
     out_dir = pathlib.Path(args.out_dir)
@@ -219,9 +229,10 @@ def main_worker(rank, world, args):
                 d["train/aux_nce"] = aux_sum / max(aux_n, 1)
             logger.log(d, step=epoch + 1)
 
-        improved = val["nll"] < st["best"]
+        score = -val["types"]["pitch"]["acc"]            # [CHANGED] pick the best epoch by VAL PITCH ACCURACY
+        improved = score < st["best"]
         if improved:
-            st["best"], st["bad"] = val["nll"], 0
+            st["best"], st["bad"] = score, 0
             if is_main:
                 save_atomic({"model_state_dict": raw.state_dict(), "model_cfg": cfg,
                              "meta": dict(epoch=epoch + 1, val_ppl=val["ppl"], val_acc=val["acc"], tag=args.tag)},
