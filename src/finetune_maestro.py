@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from music_common import (Logger, ShardedSampler, TypeStats, WindowDataset, add_model_args, assert_grammar,
                           build_model, cfg_from_args, concat_songs, count_params, evaluate, flatten_summary,
-                          format_position_curve, format_summary, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
+                          format_position_curve, format_position_curve_by_type, format_summary, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
                           make_optimizer, masked_ce, save_atomic)
 
 
@@ -130,8 +130,9 @@ def main_worker(rank, world, args):
         t = evaluate(raw, test_loader, device)
         if is_main:
             print(f"[eval_only] weights from {args.init_ckpt} | seq_len {args.seq_len}\n"
-                  f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n"
-                  f"TEST {format_summary(t)}\n{format_position_curve(t)}", flush=True)
+                  f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n{format_position_curve_by_type(v)}\n"
+                  f"TEST {format_summary(t)}\n{format_position_curve(t)}\n{format_position_curve_by_type(t)}",
+                  flush=True)
         dist.barrier()
         dist.destroy_process_group()
         return
