@@ -556,36 +556,67 @@ class TypeStats:
             c = max(float(b[1, i]), 1.0)
             n_i = float(b[2, i]) / c
             out["types"][name] = dict(acc=float(b[0, i]) / c, nll=n_i, ppl=math.exp(min(n_i, 50.0)))
+        # every note = one shift + one pitch + one duration token, so the sum of the three per-type mean NLLs
+        # is the NLL of a whole note; this number is comparable across tokenizers/models on the same data
+        out["bits_per_note"] = sum(v["nll"] for v in out["types"].values()) / math.log(2)
         return out
 
 
 def format_summary(s):
     t = " / ".join(f"{k} {v['acc'] * 100:.1f}% (ppl {v['ppl']:.2f})" for k, v in s["types"].items())
-    return f"NLL {s['nll']:.4f} | PPL {s['ppl']:.3f} | Acc {s['acc'] * 100:.2f}% | {t}"
+    return (f"NLL {s['nll']:.4f} | PPL {s['ppl']:.3f} | Acc {s['acc'] * 100:.2f}% | "
+            f"{s['bits_per_note']:.3f} bits/note | {t}")
 
 
 def flatten_summary(prefix, s):
-    d = {f"{prefix}/nll": s["nll"], f"{prefix}/perplexity": s["ppl"], f"{prefix}/accuracy": s["acc"]}
+    d = {f"{prefix}/nll": s["nll"], f"{prefix}/perplexity": s["ppl"], f"{prefix}/accuracy": s["acc"],
+         f"{prefix}/bits_per_note": s["bits_per_note"]}
     for k, v in s["types"].items():
         d[f"{prefix}/acc_{k}"] = v["acc"]
         d[f"{prefix}/ppl_{k}"] = v["ppl"]
     return d
 
 
+def format_position_curve(res, n_bins=8):
+    """Average NLL (nats/token) per window-position bin. Bins are multiples of 3 tokens, so every bin
+    contains whole shift/pitch/duration cycles and token-type mix does not distort the comparison."""
+    nll = np.asarray(res["pos_nll"], dtype=np.float64)
+    S = len(nll)
+    size = max(3, (S // n_bins) // 3 * 3)
+    bins = [(lo, min(lo + size, S)) for lo in range(0, S - size + 1, size)]
+    vals = [float(nll[lo:hi].mean()) for lo, hi in bins]
+    line = " | ".join(f"{lo}-{hi - 1}: {v:.3f}" for (lo, hi), v in zip(bins, vals))
+    mid = max(0, len(vals) // 2 - 1)
+    gain = vals[mid] - vals[-1]
+    return (f"NLL by position -> {line}\n"
+            f"context gain (bin {mid + 1} -> last bin): {gain:+.3f} nats/token ({gain / vals[mid] * 100:+.1f}%)")
+
+
 @torch.no_grad()
 def evaluate(raw_model, loader, device):
     """Evaluate on this rank's shard, then all-reduce. Uses the UNWRAPPED model (no DDP collectives), so
-    ranks may have different numbers of batches. Caller must call model.train() afterwards."""
+    ranks may have different numbers of batches. Returns the TypeStats summary plus 'pos_nll' (mean NLL per
+    window position). Caller must call model.train() afterwards."""
     raw_model.eval()
     st = TypeStats(device)
+    S = loader.dataset.seq_len
+    pos_sum = torch.zeros(S, dtype=torch.float64, device=device)
+    n_seq = torch.zeros(1, dtype=torch.float64, device=device)
     for x, y, a in loader:
         x, y, a = x.to(device, non_blocking=True), y.to(device, non_blocking=True), a.to(device, non_blocking=True)
         with autocast("cuda", dtype=torch.float16):
             logits, _ = raw_model(x, a)
         _, nll, pred = masked_ce(logits, y, x)
         st.update(pred, y, nll)
+        pos_sum += nll.double().sum(0)
+        n_seq += nll.size(0)
     st.reduce()
-    return st.summary()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(pos_sum)
+        dist.all_reduce(n_seq)
+    res = st.summary()
+    res["pos_nll"] = (pos_sum / n_seq.clamp(min=1.0)).cpu().tolist()
+    return res
 
 
 # =============================================================================

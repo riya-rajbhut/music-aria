@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from music_common import (Logger, ShardedSampler, TypeStats, WindowDataset, add_model_args, assert_grammar,
                           build_model, cfg_from_args, concat_songs, count_params, evaluate, flatten_summary,
-                          format_summary, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
+                          format_position_curve, format_summary, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
                           make_optimizer, masked_ce, save_atomic)
 
 
@@ -129,8 +129,9 @@ def main_worker(rank, world, args):
         v = evaluate(raw, val_loader, device)
         t = evaluate(raw, test_loader, device)
         if is_main:
-            print(f"[eval_only] weights from {args.init_ckpt}\nVAL  {format_summary(v)}\nTEST {format_summary(t)}",
-                  flush=True)
+            print(f"[eval_only] weights from {args.init_ckpt} | seq_len {args.seq_len}\n"
+                  f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n"
+                  f"TEST {format_summary(t)}\n{format_position_curve(t)}", flush=True)
         dist.barrier()
         dist.destroy_process_group()
         return
@@ -238,7 +239,8 @@ def main_worker(rank, world, args):
     raw.load_state_dict(bk["model_state_dict"])
     test = evaluate(raw, test_loader, device)
     if is_main:
-        print(f"=== TEST (best checkpoint, epoch {bk['meta']['epoch']}) ===\n{format_summary(test)}", flush=True)
+        print(f"=== TEST (best checkpoint, epoch {bk['meta']['epoch']}) ===\n{format_summary(test)}\n"
+              f"{format_position_curve(test)}", flush=True)
         logger.log(flatten_summary("test", test))
         logger.summary({"test/perplexity": test["ppl"], "test/accuracy": test["acc"],
                         "best_val_ppl": bk["meta"]["val_ppl"]})
