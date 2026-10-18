@@ -41,6 +41,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pretty_midi")
 VOCAB = 384
 TICKS_PER_SECOND = 32
 MAX_TICKS = 127
+# [CHANGED] Fine-tuning knobs. finetune_maestro.py overwrites these from its command-line args at start-up
+# (--time_tol / --pitch_w / --tol_loss). The defaults below reproduce the ORIGINAL behaviour, so
+# pretrain_aria.py is unaffected.
+TIME_TOL = 0       # shift/duration counted correct if within +-TIME_TOL ticks (1 tick = 1/32 s; 3 ticks ~ 94 ms)
+PITCH_W = 1.0      # loss weight on pitch targets (1.0 = same as before)
+TOL_LOSS = False   # True: train shift/duration with -log P(within +-TIME_TOL ticks) instead of exact-tick CE
 TOKEN_TYPE_NAMES = ("pitch", "time_shift", "duration")
 
 
@@ -553,19 +559,41 @@ def assert_grammar(x, y):
 
 
 def masked_ce(logits, targets, inputs, smoothing=0.0):
-    """Cross-entropy over the VALID token type only (type is derived from the input token).
-    Label smoothing is spread over valid classes only (nn.CrossEntropyLoss would give inf here).
-    Returns (training loss, per-token UNSMOOTHED nll [detached], argmax prediction)."""
+    """[CHANGED] Cross-entropy over the VALID token type only (type is derived from the input token).
+    Extras controlled by module globals: PITCH_W (pitch loss weight), TOL_LOSS + TIME_TOL (tolerance loss for
+    time tokens), TIME_TOL (also decides how time-token predictions are made for the accuracy metric).
+    Returns (training loss, per-token EXACT unsmoothed nll [detached], prediction)."""
     allowed_tbl, nxt_tbl = _tables(inputs.device)
-    allowed = allowed_tbl[nxt_tbl[token_type_ids(inputs)]]                 # (B,S,V)
+    nxt = nxt_tbl[token_type_ids(inputs)]                          # type of the TARGET at each position (0 = pitch)
+    allowed = allowed_tbl[nxt]                                     # (B,S,V)
     logp = F.log_softmax(logits.float().masked_fill(~allowed, float("-inf")), dim=-1)
-    nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)      # exact NLL, used for reporting
+    train_nll = nll
+    if TOL_LOSS and TIME_TOL > 0:
+        # time tokens: -log of the probability mass within +-TIME_TOL ticks of the target (same token type only)
+        V = logp.size(-1)
+        t = torch.where(nxt == 0, torch.full_like(targets, 192), targets)        # dummy target at pitch positions
+        off = torch.arange(-TIME_TOL, TIME_TOL + 1, device=logp.device)
+        idx = t.unsqueeze(-1) + off                                               # (B,S,2*tol+1)
+        base = torch.where(t >= 256, torch.full_like(t, 256), torch.full_like(t, 128)).unsqueeze(-1)
+        valid = (idx >= base) & (idx < base + 128)
+        lp = logp.gather(-1, idx.clamp(0, V - 1)).clamp(min=-1e4).masked_fill(~valid, -1e4)
+        tol_nll = -torch.logsumexp(lp, dim=-1)
+        train_nll = torch.where(nxt == 0, nll, tol_nll)
+    w = torch.where(nxt == 0, torch.full_like(nll, PITCH_W), torch.ones_like(nll))
     if smoothing > 0:
         smooth = -logp.masked_fill(~allowed, 0.0).sum(-1) / allowed.sum(-1)
-        loss = ((1.0 - smoothing) * nll + smoothing * smooth).mean()
+        per = (1.0 - smoothing) * train_nll + smoothing * smooth
     else:
-        loss = nll.mean()
-    return loss, nll.detach(), logp.argmax(-1)
+        per = train_nll
+    loss = (w * per).sum() / w.sum()
+    pred = logp.argmax(-1)
+    if TIME_TOL > 0:
+        # time tokens: predict the CENTRE of the best (2*TIME_TOL+1)-tick window (maximises the tolerance accuracy)
+        V = logp.size(-1)
+        sm = F.avg_pool1d(logp.detach().exp().reshape(-1, 1, V), 2 * TIME_TOL + 1, 1, TIME_TOL).reshape(logp.shape)
+        pred = torch.where(nxt == 0, pred, sm.masked_fill(~allowed, -1.0).argmax(-1))
+    return loss, nll.detach(), pred
 
 
 class TypeStats:
@@ -579,7 +607,10 @@ class TypeStats:
 
     def update(self, pred, target, nll):
         tid = token_type_ids(target).reshape(-1)
-        self.buf[0].index_add_(0, tid, (pred == target).reshape(-1).double())
+        hit = pred == target
+        if TIME_TOL > 0:                                   # [CHANGED] shift/duration: correct if within +-TIME_TOL ticks
+            hit = torch.where(target >= 128, (pred - target).abs() <= TIME_TOL, hit)
+        self.buf[0].index_add_(0, tid, hit.reshape(-1).double())
         self.buf[1].index_add_(0, tid, torch.ones_like(tid, dtype=torch.float64))
         self.buf[2].index_add_(0, tid, nll.reshape(-1).double())
 
