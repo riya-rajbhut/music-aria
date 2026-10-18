@@ -592,6 +592,22 @@ def format_position_curve(res, n_bins=8):
             f"context gain (bin {mid + 1} -> last bin): {gain:+.3f} nats/token ({gain / vals[mid] * 100:+.1f}%)")
 
 
+def format_position_curve_by_type(res, n_bins=8):
+    """Same curve, split by token type. Every window starts on a time_shift token, so the target at position p
+    is a pitch if p%3==0, a duration if p%3==1 and a time_shift if p%3==2. Bins are counted in notes."""
+    nll = np.asarray(res["pos_nll"], dtype=np.float64)
+    lines = []
+    for name, off in (("pitch", 0), ("duration", 1), ("time_shift", 2)):
+        v = nll[off::3]
+        size = max(1, len(v) // n_bins)
+        vals = [float(v[lo:lo + size].mean()) for lo in range(0, len(v) - size + 1, size)]
+        mid = max(0, len(vals) // 2 - 1)
+        gain = vals[mid] - vals[-1]
+        lines.append(f"  {name:<10} " + " ".join(f"{x:.3f}" for x in vals) +
+                     f" | gain bin {mid + 1}->last: {gain:+.3f} ({gain / vals[mid] * 100:+.1f}%)")
+    return "NLL by position and token type (bins of notes, left = start of window):\n" + "\n".join(lines)
+
+
 @torch.no_grad()
 def evaluate(raw_model, loader, device):
     """Evaluate on this rank's shard, then all-reduce. Uses the UNWRAPPED model (no DDP collectives), so
