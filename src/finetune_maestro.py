@@ -59,6 +59,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--eval_only", action="store_true",
+                   help="no training: evaluate the weights given by --init_ckpt on MAESTRO val + test and exit")
     p.add_argument("--seed", type=int, default=53)
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_project", default="music-rnn-ddp")
@@ -123,6 +125,15 @@ def main_worker(rank, world, args):
     best_path = out_dir / f"best_maestro_{args.tag}.pt"
     last_path = out_dir / f"finetune_last_{args.tag}.pt"
     st = dict(epoch=0, step=0, best=float("inf"), bad=0, wandb_id=None)
+    if args.eval_only:        # e.g. --eval_only --init_ckpt artifacts/best_maestro_aria_init.pt
+        v = evaluate(raw, val_loader, device)
+        t = evaluate(raw, test_loader, device)
+        if is_main:
+            print(f"[eval_only] weights from {args.init_ckpt}\nVAL  {format_summary(v)}\nTEST {format_summary(t)}",
+                  flush=True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
     if args.resume and last_path.exists():
         lk = torch.load(last_path, map_location=device, weights_only=True)
         raw.load_state_dict(lk["model_state_dict"])
