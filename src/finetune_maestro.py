@@ -44,6 +44,9 @@ def parse_args():
     p.add_argument("--train_hop", type=int, default=384)
     p.add_argument("--eval_hop", type=int, default=384)
     p.add_argument("--no_jitter", action="store_true", help="fixed window grid (v9 behaviour)")
+    p.add_argument("--score_from", type=int, default=0, help="evaluation only: count positions >= this index "
+                   "(multiple of 3). Use with --eval_hop = seq_len - score_from so each token is scored once with "
+                   ">= score_from tokens of context, e.g. --seq_len 768 --score_from 384 --eval_hop 384")
     p.add_argument("--transpose", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=16, help="per GPU micro-batch")
     p.add_argument("--accum", type=int, default=2)
@@ -126,8 +129,8 @@ def main_worker(rank, world, args):
     last_path = out_dir / f"finetune_last_{args.tag}.pt"
     st = dict(epoch=0, step=0, best=float("inf"), bad=0, wandb_id=None)
     if args.eval_only:        # e.g. --eval_only --init_ckpt artifacts/best_maestro_aria_init.pt
-        v = evaluate(raw, val_loader, device)
-        t = evaluate(raw, test_loader, device)
+        v = evaluate(raw, val_loader, device, args.score_from)
+        t = evaluate(raw, test_loader, device, args.score_from)
         if is_main:
             print(f"[eval_only] weights from {args.init_ckpt} | seq_len {args.seq_len}\n"
                   f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n{format_position_curve_by_type(v)}\n"
@@ -151,7 +154,7 @@ def main_worker(rank, world, args):
 
     # zero-shot validation of the pretrained model (transfer signal) -------------------------------
     if init and st["epoch"] == 0:
-        r0 = evaluate(raw, val_loader, device)
+        r0 = evaluate(raw, val_loader, device, args.score_from)
         if is_main:
             print(f"[zero-shot, before MAESTRO training] VAL {format_summary(r0)}", flush=True)
             logger.log({**flatten_summary("val", r0), "epoch": 0}, step=0)
@@ -205,7 +208,7 @@ def main_worker(rank, world, args):
         trs = tr.summary()
         if not math.isfinite(trs["nll"]):
             raise RuntimeError("non-finite training loss")
-        val = evaluate(raw, val_loader, device)
+        val = evaluate(raw, val_loader, device, args.score_from)
         if is_main:
             print(f"Epoch [{epoch + 1}/{args.epochs}] | LR {lr:.2e} | TRAIN {format_summary(trs)}", flush=True)
             print(f"{'':>16}VAL   {format_summary(val)}", flush=True)
@@ -238,7 +241,7 @@ def main_worker(rank, world, args):
     dist.barrier()
     bk = torch.load(best_path, map_location=device, weights_only=True)
     raw.load_state_dict(bk["model_state_dict"])
-    test = evaluate(raw, test_loader, device)
+    test = evaluate(raw, test_loader, device, args.score_from)
     if is_main:
         print(f"=== TEST (best checkpoint, epoch {bk['meta']['epoch']}) ===\n{format_summary(test)}\n"
               f"{format_position_curve(test)}", flush=True)

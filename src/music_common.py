@@ -609,10 +609,12 @@ def format_position_curve_by_type(res, n_bins=8):
 
 
 @torch.no_grad()
-def evaluate(raw_model, loader, device):
+def evaluate(raw_model, loader, device, score_from=0):
     """Evaluate on this rank's shard, then all-reduce. Uses the UNWRAPPED model (no DDP collectives), so
     ranks may have different numbers of batches. Returns the TypeStats summary plus 'pos_nll' (mean NLL per
-    window position). Caller must call model.train() afterwards."""
+    window position, always over ALL positions). score_from=k counts only positions >= k in the summary
+    metrics, so every scored token has at least k tokens of context (use eval_hop = seq_len - k so each token
+    is scored once). Caller must call model.train() afterwards."""
     raw_model.eval()
     st = TypeStats(device)
     S = loader.dataset.seq_len
@@ -623,7 +625,7 @@ def evaluate(raw_model, loader, device):
         with autocast("cuda", dtype=torch.float16):
             logits, _ = raw_model(x, a)
         _, nll, pred = masked_ce(logits, y, x)
-        st.update(pred, y, nll)
+        st.update(pred[:, score_from:], y[:, score_from:], nll[:, score_from:])
         pos_sum += nll.double().sum(0)
         n_seq += nll.size(0)
     st.reduce()
