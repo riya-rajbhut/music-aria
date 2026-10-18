@@ -186,8 +186,7 @@ class WindowDataset(data.Dataset):
       * every window starts on a time_shift token (start offsets are multiples of 3 within a song)
       * jitter=True : random 3-aligned start offset inside each hop (a different view every epoch)
       * transpose=k : random pitch shift in [-k, k] semitones (skipped if it would leave 0..127)
-      * 'active pitch' (pitch of the most recent pitch token) is seeded from the previous note when the
-        window starts mid-song, exactly like the full-song forward fill used in v9
+      * chord-bass polyphonic active pitch tracking for vertical harmonic awareness.
     """
 
     def __init__(self, tokens, offsets, song_ids, seq_len, hop, jitter=False, transpose=0,
@@ -216,57 +215,53 @@ class WindowDataset(data.Dataset):
     def n_tokens(self):
         return len(self) * self.seq_len
 
-def __getitem__(self, i):
-    k = int(self.win_song[i])
-    rel = int(self.win_rel[i])
-    if self.jitter:
-        rel = min(rel + 3 * random.randrange(self.hop // 3), int(self.max_rel[k]))
-    start = int(self.song_start[k]) + rel
-    pre = 2 if rel >= 3 else 0            # previous note's pitch token sits at rel-2
-    chunk = torch.from_numpy(np.asarray(self.tokens[start - pre: start + self.seq_len + 1],
-                                        dtype=np.int64).copy())
-    if self.transpose:
-        shift = random.randint(-self.transpose, self.transpose)
-        if shift != 0:
-            is_p = chunk < 128
-            if bool(is_p.any()):
-                pv = chunk[is_p]
-                if int(pv.min()) + shift >= 0 and int(pv.max()) + shift <= 127:
-                    chunk[is_p] = pv + shift
+    def __getitem__(self, i):
+        k = int(self.win_song[i])
+        rel = int(self.win_rel[i])
+        if self.jitter:
+            rel = min(rel + 3 * random.randrange(self.hop // 3), int(self.max_rel[k]))
+        start = int(self.song_start[k]) + rel
+        pre = 2 if rel >= 3 else 0            # previous note's pitch token sits at rel-2
+        chunk = torch.from_numpy(np.asarray(self.tokens[start - pre: start + self.seq_len + 1],
+                                            dtype=np.int64).copy())
+        if self.transpose:
+            shift = random.randint(-self.transpose, self.transpose)
+            if shift != 0:
+                is_p = chunk < 128
+                if bool(is_p.any()):
+                    pv = chunk[is_p]
+                    if int(pv.min()) + shift >= 0 and int(pv.max()) + shift <= 127:
+                        chunk[is_p] = pv + shift
 
-    # --- POLYPHONIC CHORD-BASS PITCH TRACKING FIX ---
-    chunk_np = chunk.cpu().numpy()
-    is_shift = (chunk_np >= 128) & (chunk_np < 256)
-    # Compute cumulative musical time ticks
-    ticks_np = np.where(is_shift, chunk_np - 128, 0).cumsum()
-    
-    active_np = np.zeros_like(chunk_np, dtype=np.int64)
-    last_p = 60
-    chord_bass = 60
-    curr_tick = -1
-    
-    for idx in range(len(chunk_np)):
-        tok = chunk_np[idx]
-        t = ticks_np[idx]
-        if tok < 128:  # Pitch token
-            if t != curr_tick:
-                # New time step / onset: record bass note, reference previous melodic note
-                curr_tick = t
-                chord_bass = tok
-                active_np[idx] = last_p
-                last_p = tok
+        # --- POLYPHONIC CHORD-BASS PITCH TRACKING FIX ---
+        chunk_np = chunk.cpu().numpy()
+        is_shift = (chunk_np >= 128) & (chunk_np < 256)
+        ticks_np = np.where(is_shift, chunk_np - 128, 0).cumsum()
+        
+        active_np = np.zeros_like(chunk_np, dtype=np.int64)
+        last_p = 60
+        chord_bass = 60
+        curr_tick = -1
+        
+        for idx in range(len(chunk_np)):
+            tok = chunk_np[idx]
+            t = ticks_np[idx]
+            if tok < 128:  # Pitch token
+                if t != curr_tick:
+                    curr_tick = t
+                    chord_bass = tok
+                    active_np[idx] = last_p
+                    last_p = tok
+                else:
+                    active_np[idx] = chord_bass
             else:
-                # Same tick (chord note): reference the chord's bass note for vertical harmony
-                active_np[idx] = chord_bass
-        else:
-            active_np[idx] = last_p
-            
-    active = torch.from_numpy(active_np).to(chunk.device)
-    # -----------------------------------------------
+                active_np[idx] = last_p
+                
+        active = torch.from_numpy(active_np).to(chunk.device)
+        # -----------------------------------------------
 
-    chunk, active = chunk[pre:], active[pre:]
-    return chunk[:-1], chunk[1:], active[:-1]
-
+        chunk, active = chunk[pre:], active[pre:]
+        return chunk[:-1], chunk[1:], active[:-1]
 class ShardedSampler(data.Sampler):
     """Rank-sharded sampler with deterministic per-epoch shuffle and an optional `skip` (for exact resume).
     shuffle=False + drop_last=False gives an exact (un-padded) evaluation shard."""
