@@ -48,6 +48,8 @@ def parse_args():
                    "(multiple of 3). Use with --eval_hop = seq_len - score_from so each token is scored once with "
                    ">= score_from tokens of context, e.g. --seq_len 768 --score_from 384 --eval_hop 384")
     p.add_argument("--transpose", type=int, default=5)
+    p.add_argument("--time_stretch", action="store_true",
+                   help="augmentation: random time stretch in {0.95,0.975,1,1.025,1.05} (MAESTRO-paper recipe)")
     p.add_argument("--batch_size", type=int, default=16, help="per GPU micro-batch")
     p.add_argument("--accum", type=int, default=2)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -88,7 +90,7 @@ def main_worker(rank, world, args):
         tok, off = concat_songs(songs[split])
         sets[split] = (tok, off, np.arange(len(off) - 1))
     train_ds = WindowDataset(*sets["train"], args.seq_len, args.train_hop, jitter=not args.no_jitter,
-                             transpose=args.transpose)
+                             transpose=args.transpose, time_stretch=args.time_stretch)
     val_ds = WindowDataset(*sets["validation"], args.seq_len, args.eval_hop)
     test_ds = WindowDataset(*sets["test"], args.seq_len, args.eval_hop)
     if is_main:

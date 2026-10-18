@@ -52,6 +52,7 @@ def parse_args():
     p.add_argument("--label_smoothing", type=float, default=0.0)
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--transpose", type=int, default=5, help="max random transposition (semitones)")
+    p.add_argument("--time_stretch", action="store_true", help="augmentation: random time stretch 0.95-1.05")
     p.add_argument("--val_songs", type=int, default=300)
     p.add_argument("--val_windows", type=int, default=3072)
     p.add_argument("--eval_every", type=int, default=1000)
@@ -105,7 +106,8 @@ def main_worker(rank, world, args):
     perm = np.random.default_rng(args.seed).permutation(eligible)
     n_val = min(args.val_songs, max(20, int(0.01 * len(perm))), len(perm) // 2)
     val_ids, train_ids = np.sort(perm[:n_val]), np.sort(perm[n_val:])
-    train_ds = WindowDataset(tokens, offsets, train_ids, args.seq_len, args.hop, jitter=True, transpose=args.transpose)
+    train_ds = WindowDataset(tokens, offsets, train_ids, args.seq_len, args.hop, jitter=True, transpose=args.transpose,
+                             time_stretch=args.time_stretch)
     val_ds = WindowDataset(tokens, offsets, val_ids, args.seq_len, args.seq_len, max_windows=args.val_windows)
     if is_main:
         print(f"corpus: {len(offsets) - 1} songs, {int(keep.sum())} kept after dedup | train songs {len(train_ids)} "
