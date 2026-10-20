@@ -62,6 +62,7 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--label_smoothing", type=float, default=0.05)
     p.add_argument("--clip", type=float, default=0.5)
+    p.add_argument("--pitch_weight", type=float, default=1.0, help="training-loss weight on pitch targets")
     p.add_argument("--contrastive_weight", type=float, default=0.0, help="optional CPC aux loss (0 = off)")
     p.add_argument("--cpc_ks", type=str, default="3,6")
     p.add_argument("--num_workers", type=int, default=2)
@@ -195,7 +196,7 @@ def main_worker(rank, world, args):
             with (nullcontext() if last_micro else model.no_sync()):
                 with autocast("cuda", dtype=torch.float16):
                     logits, aux = model(x, a, targets=y if use_cpc else None)
-                loss, nll, pred = masked_ce(logits, y, x, args.label_smoothing)
+                loss, nll, pred = masked_ce(logits, y, x, args.label_smoothing, args.pitch_weight)
                 total = loss + (args.contrastive_weight * aux.float() if use_cpc else 0.0)
                 scaler.scale(total / args.accum).backward()
             tr.update(pred, y, nll)

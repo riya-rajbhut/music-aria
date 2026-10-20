@@ -532,7 +532,7 @@ def assert_grammar(x, y):
                            "(corpus is not a clean shift/pitch/duration cycle starting on a time_shift).")
 
 
-def masked_ce(logits, targets, inputs, smoothing=0.0):
+def masked_ce(logits, targets, inputs, smoothing=0.0, pitch_weight=1.0):
     """Cross-entropy over the VALID token type only (type is derived from the input token).
     Label smoothing is spread over valid classes only (nn.CrossEntropyLoss would give inf here).
     Returns (training loss, per-token UNSMOOTHED nll [detached], argmax prediction)."""
@@ -542,11 +542,15 @@ def masked_ce(logits, targets, inputs, smoothing=0.0):
     nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     if smoothing > 0:
         smooth = -logp.masked_fill(~allowed, 0.0).sum(-1) / allowed.sum(-1)
-        loss = ((1.0 - smoothing) * nll + smoothing * smooth).mean()
+        per = (1.0 - smoothing) * nll + smoothing * smooth
     else:
-        loss = nll.mean()
+        per = nll
+    if pitch_weight != 1.0:
+        w = torch.where(targets < 128, torch.full_like(per, pitch_weight), torch.ones_like(per))
+        loss = (per * w).sum() / w.sum()
+    else:
+        loss = per.mean()
     return loss, nll.detach(), logp.argmax(-1)
-
 
 class TypeStats:
     """Accumulates correct / count / nll-sum per token type. PPL = exp(mean UNSMOOTHED masked NLL)."""
