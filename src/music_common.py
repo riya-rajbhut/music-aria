@@ -61,14 +61,24 @@ def midi_to_tokens(path) -> np.ndarray:
     if not insts:
         return empty
     inst = max(insts, key=lambda i: len(i.notes))
-    notes = sorted(inst.notes, key=lambda n: (n.start, n.pitch))
+    notes = list(inst.notes)
     n = len(notes)
-    start = np.fromiter((x.start for x in notes), dtype=np.float64, count=n)
-    end = np.fromiter((x.end for x in notes), dtype=np.float64, count=n)
-    pitch = np.fromiter((x.pitch for x in notes), dtype=np.int64, count=n)
-    prev = np.concatenate(([start[0]], start[:-1]))
-    step = np.minimum(((start - prev) * TICKS_PER_SECOND).astype(np.int64), MAX_TICKS)
-    dur = np.clip(((end - start) * TICKS_PER_SECOND).astype(np.int64), 1, MAX_TICKS)
+    start_all = np.fromiter((x.start for x in notes), dtype=np.float64, count=n)
+    end_all = np.fromiter((x.end for x in notes), dtype=np.float64, count=n)
+    pitch_all = np.fromiter((x.pitch for x in notes), dtype=np.int64, count=n)
+    if os.environ.get("CANON_CHORDS") == "1":      # quantise onsets to ticks FIRST, then sort by (tick, pitch)
+        tick_all = np.floor(start_all * TICKS_PER_SECOND + 1e-6).astype(np.int64)
+        order = np.lexsort((pitch_all, tick_all))
+    else:                                          # original behaviour
+        order = np.lexsort((pitch_all, start_all))
+    start, end, pitch = start_all[order], end_all[order], pitch_all[order]
+    if os.environ.get("CANON_CHORDS") == "1":
+        tick = tick_all[order]
+        step = np.minimum(np.diff(tick, prepend=tick[0]), MAX_TICKS)
+    else:
+        prev = np.concatenate(([start[0]], start[:-1]))
+        step = np.minimum(((start - prev) * TICKS_PER_SECOND).astype(np.int64), MAX_TICKS)
+    dur = np.clip(((end - start) * TICKS_PER_SECOND).astype(np.int64), 1, MAX_TICKS)    
     out = np.empty(3 * n, dtype=np.uint16)
     out[0::3] = 128 + step
     out[1::3] = pitch
@@ -107,7 +117,8 @@ def load_or_build_maestro_cache(dest_dir="data", workers=4) -> dict:
     """{'train': [uint16 arrays], 'validation': [...], 'test': [...]} using MAESTRO's OFFICIAL split
     (split by composition, so no composition appears in two splits)."""
     folder = ensure_maestro(dest_dir)
-    cache = folder / "converted_tokens_v7_official_split.pkl"
+    cache = folder / ("converted_tokens_v8_canon.pkl" if os.environ.get("CANON_CHORDS") == "1"
+                    else "converted_tokens_v7_official_split.pkl")
     if cache.exists():
         try:
             with cache.open("rb") as f:
