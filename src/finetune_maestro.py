@@ -121,6 +121,7 @@ def main_worker(rank, world, args):
         load_weights(raw, ck["model_state_dict"])
         if is_main:
             print(f"loaded pretrained weights from {args.init_ckpt} | meta {ck.get('meta')}", flush=True)
+    init_meta = ck.get("meta") if init else None
     del ck
     torch.manual_seed(args.seed + rank)
     random.seed(args.seed + rank)
@@ -137,6 +138,11 @@ def main_worker(rank, world, args):
     if args.eval_only:        # e.g. --eval_only --init_ckpt artifacts/best_maestro_aria_init.pt
         v = evaluate(raw, val_loader, device, args.score_from, tols)
         t = evaluate(raw, test_loader, device, args.score_from, tols)
+        if is_main and init_meta and "tag" in init_meta and args.score_from == 0:
+            # a fine-tuned checkpoint stores the validation PPL measured at training time with this same protocol
+            ok = abs(v["ppl"] / init_meta["val_ppl"] - 1.0) < 0.02
+            print(f"[sanity] checkpoint meta val PPL {init_meta['val_ppl']:.3f} vs measured {v['ppl']:.3f} -> "
+                  f"{'OK' if ok else 'MISMATCH: the model or the data path is not what was trained'}", flush=True)
         if is_main:
             extra = lambda r: (("\n" + format_tolerance(r)) if tols else "") + "\n" + format_pitch_diag(r)
             print(f"[eval_only] weights from {args.init_ckpt} | seq_len {args.seq_len}\n"
