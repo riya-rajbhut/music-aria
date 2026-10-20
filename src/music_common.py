@@ -41,12 +41,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pretty_midi")
 VOCAB = 384
 TICKS_PER_SECOND = 32
 MAX_TICKS = 127
-# [CHANGED] Fine-tuning knobs. finetune_maestro.py overwrites these from its command-line args at start-up
-# (--time_tol / --pitch_w / --tol_loss). The defaults below reproduce the ORIGINAL behaviour, so
-# pretrain_aria.py is unaffected.
-TIME_TOL = 0       # shift/duration counted correct if within +-TIME_TOL ticks (1 tick = 1/32 s; 3 ticks ~ 94 ms)
-PITCH_W = 1.0      # loss weight on pitch targets (1.0 = same as before)
-TOL_LOSS = False   # True: train shift/duration with -log P(within +-TIME_TOL ticks) instead of exact-tick CE
 TOKEN_TYPE_NAMES = ("pitch", "time_shift", "duration")
 
 
@@ -539,41 +533,19 @@ def assert_grammar(x, y):
 
 
 def masked_ce(logits, targets, inputs, smoothing=0.0):
-    """[CHANGED] Cross-entropy over the VALID token type only (type is derived from the input token).
-    Extras controlled by module globals: PITCH_W (pitch loss weight), TOL_LOSS + TIME_TOL (tolerance loss for
-    time tokens), TIME_TOL (also decides how time-token predictions are made for the accuracy metric).
-    Returns (training loss, per-token EXACT unsmoothed nll [detached], prediction)."""
+    """Cross-entropy over the VALID token type only (type is derived from the input token).
+    Label smoothing is spread over valid classes only (nn.CrossEntropyLoss would give inf here).
+    Returns (training loss, per-token UNSMOOTHED nll [detached], argmax prediction)."""
     allowed_tbl, nxt_tbl = _tables(inputs.device)
-    nxt = nxt_tbl[token_type_ids(inputs)]                          # type of the TARGET at each position (0 = pitch)
-    allowed = allowed_tbl[nxt]                                     # (B,S,V)
+    allowed = allowed_tbl[nxt_tbl[token_type_ids(inputs)]]                 # (B,S,V)
     logp = F.log_softmax(logits.float().masked_fill(~allowed, float("-inf")), dim=-1)
-    nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)      # exact NLL, used for reporting
-    train_nll = nll
-    if TOL_LOSS and TIME_TOL > 0:
-        # time tokens: -log of the probability mass within +-TIME_TOL ticks of the target (same token type only)
-        V = logp.size(-1)
-        t = torch.where(nxt == 0, torch.full_like(targets, 192), targets)        # dummy target at pitch positions
-        off = torch.arange(-TIME_TOL, TIME_TOL + 1, device=logp.device)
-        idx = t.unsqueeze(-1) + off                                               # (B,S,2*tol+1)
-        base = torch.where(t >= 256, torch.full_like(t, 256), torch.full_like(t, 128)).unsqueeze(-1)
-        valid = (idx >= base) & (idx < base + 128)
-        lp = logp.gather(-1, idx.clamp(0, V - 1)).clamp(min=-1e4).masked_fill(~valid, -1e4)
-        tol_nll = -torch.logsumexp(lp, dim=-1)
-        train_nll = torch.where(nxt == 0, nll, tol_nll)
-    w = torch.where(nxt == 0, torch.full_like(nll, PITCH_W), torch.ones_like(nll))
+    nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     if smoothing > 0:
         smooth = -logp.masked_fill(~allowed, 0.0).sum(-1) / allowed.sum(-1)
-        per = (1.0 - smoothing) * train_nll + smoothing * smooth
+        loss = ((1.0 - smoothing) * nll + smoothing * smooth).mean()
     else:
-        per = train_nll
-    loss = (w * per).sum() / w.sum()
-    pred = logp.argmax(-1)
-    if TIME_TOL > 0:
-        # time tokens: predict the CENTRE of the best (2*TIME_TOL+1)-tick window (maximises the tolerance accuracy)
-        V = logp.size(-1)
-        sm = F.avg_pool1d(logp.detach().exp().reshape(-1, 1, V), 2 * TIME_TOL + 1, 1, TIME_TOL).reshape(logp.shape)
-        pred = torch.where(nxt == 0, pred, sm.masked_fill(~allowed, -1.0).argmax(-1))
-    return loss, nll.detach(), pred
+        loss = nll.mean()
+    return loss, nll.detach(), logp.argmax(-1)
 
 
 class TypeStats:
@@ -587,10 +559,7 @@ class TypeStats:
 
     def update(self, pred, target, nll):
         tid = token_type_ids(target).reshape(-1)
-        hit = pred == target
-        if TIME_TOL > 0:                                   # [CHANGED] shift/duration: correct if within +-TIME_TOL ticks
-            hit = torch.where(target >= 128, (pred - target).abs() <= TIME_TOL, hit)
-        self.buf[0].index_add_(0, tid, hit.reshape(-1).double())
+        self.buf[0].index_add_(0, tid, (pred == target).reshape(-1).double())
         self.buf[1].index_add_(0, tid, torch.ones_like(tid, dtype=torch.float64))
         self.buf[2].index_add_(0, tid, nll.reshape(-1).double())
 
@@ -660,8 +629,65 @@ def format_position_curve_by_type(res, n_bins=8):
     return "NLL by position and token type (bins of notes, left = start of window):\n" + "\n".join(lines)
 
 
+def tolerance_hits(logits, targets, inputs, tols):
+    """Tolerance-aware accuracy for time_shift and duration targets (one tick = 1/32 s = 31.25 ms).
+    For tolerance t the prediction is the class c that maximises the probability mass P(c-t .. c+t)
+    ("window-mass decoding", the best single guess under a tolerance metric); it is a hit if |c - target| <= t.
+    t = 0 is ordinary arg-max accuracy. Returns (hits [2, len(tols)], counts [2]); rows = (time_shift, duration)."""
+    allowed_tbl, nxt_tbl = _tables(inputs.device)
+    allowed = allowed_tbl[nxt_tbl[token_type_ids(inputs)]]
+    p = F.softmax(logits.float().masked_fill(~allowed, float("-inf")), dim=-1)
+    tt = token_type_ids(targets)
+    hits = torch.zeros(2, len(tols), dtype=torch.float64, device=targets.device)
+    cnt = torch.zeros(2, dtype=torch.float64, device=targets.device)
+    idx = torch.arange(128, device=targets.device)
+    for row, (typ, lo) in enumerate(((1, 128), (2, 256))):
+        m = tt == typ
+        n = int(m.sum())
+        if n == 0:
+            continue
+        ps = p[m][:, lo:lo + 128]                              # (n,128) class probabilities
+        tgt = targets[m] - lo
+        cnt[row] = n
+        cs = F.pad(ps.cumsum(-1), (1, 0))                      # cs[:, j] = mass of the first j classes
+        for j, t in enumerate(tols):
+            mass = cs[:, (idx + t + 1).clamp(max=128)] - cs[:, (idx - t).clamp(min=0)]    # P(c-t .. c+t)
+            hits[row, j] = ((mass.argmax(-1) - tgt).abs() <= t).sum()
+    return hits, cnt
+
+
+def pitch_diagnostics(pred, targets):
+    """Where do pitch errors come from? Returns (counts[5]) = [n, exact, same pitch class, same octave, within +-1
+    semitone] over positions whose target is a pitch (arg-max predictions)."""
+    m = targets < 128
+    p, t = pred[m], targets[m]
+    ok = p < 128
+    return torch.stack([
+        torch.tensor(float(t.numel()), device=t.device, dtype=torch.float64),
+        (p == t).sum().double(),
+        (ok & (p % 12 == t % 12)).sum().double(),
+        (ok & (p // 12 == t // 12)).sum().double(),
+        (ok & ((p - t).abs() <= 1)).sum().double()])
+
+
+def format_tolerance(res):
+    tol = res["tol"]
+    ticks = tol["tols"]
+    lines = ["tolerance accuracy (1 tick = 31.25 ms; window-mass decoding)  ticks: " +
+             " ".join(f"+-{t}({t * 31.25:.0f}ms)" for t in ticks)]
+    for name in ("time_shift", "duration"):
+        lines.append(f"  {name:<10} " + "  ".join(f"{a * 100:5.1f}%" for a in tol[name]))
+    return "\n".join(lines)
+
+
+def format_pitch_diag(res):
+    d = res["pitch_diag"]
+    return ("pitch error structure (arg-max): exact {exact:.1f}% | same pitch class {pitch_class:.1f}% | "
+            "same octave {octave:.1f}% | within +-1 semitone {within1:.1f}%").format(**{k: v * 100 for k, v in d.items()})
+
+
 @torch.no_grad()
-def evaluate(raw_model, loader, device, score_from=0):
+def evaluate(raw_model, loader, device, score_from=0, tols=()):
     """Evaluate on this rank's shard, then all-reduce. Uses the UNWRAPPED model (no DDP collectives), so
     ranks may have different numbers of batches. Returns the TypeStats summary plus 'pos_nll' (mean NLL per
     window position, always over ALL positions). score_from=k counts only positions >= k in the summary
@@ -672,20 +698,38 @@ def evaluate(raw_model, loader, device, score_from=0):
     S = loader.dataset.seq_len
     pos_sum = torch.zeros(S, dtype=torch.float64, device=device)
     n_seq = torch.zeros(1, dtype=torch.float64, device=device)
+    tol_hits = torch.zeros(2, max(len(tols), 1), dtype=torch.float64, device=device)
+    tol_cnt = torch.zeros(2, dtype=torch.float64, device=device)
+    pdiag = torch.zeros(5, dtype=torch.float64, device=device)
     for x, y, a in loader:
         x, y, a = x.to(device, non_blocking=True), y.to(device, non_blocking=True), a.to(device, non_blocking=True)
         with autocast("cuda", dtype=torch.float16):
             logits, _ = raw_model(x, a)
         _, nll, pred = masked_ce(logits, y, x)
         st.update(pred[:, score_from:], y[:, score_from:], nll[:, score_from:])
+        pdiag += pitch_diagnostics(pred[:, score_from:], y[:, score_from:])
+        if tols:
+            h, c = tolerance_hits(logits[:, score_from:], y[:, score_from:], x[:, score_from:], tols)
+            tol_hits += h
+            tol_cnt += c
         pos_sum += nll.double().sum(0)
         n_seq += nll.size(0)
     st.reduce()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(pos_sum)
         dist.all_reduce(n_seq)
+        dist.all_reduce(tol_hits)
+        dist.all_reduce(tol_cnt)
+        dist.all_reduce(pdiag)
     res = st.summary()
     res["pos_nll"] = (pos_sum / n_seq.clamp(min=1.0)).cpu().tolist()
+    d = pdiag.cpu().tolist()
+    n = max(d[0], 1.0)
+    res["pitch_diag"] = dict(exact=d[1] / n, pitch_class=d[2] / n, octave=d[3] / n, within1=d[4] / n)
+    if tols:
+        th, tc = tol_hits.cpu().numpy(), tol_cnt.cpu().numpy()
+        res["tol"] = dict(tols=list(tols), time_shift=(th[0] / max(tc[0], 1.0)).tolist(),
+                          duration=(th[1] / max(tc[1], 1.0)).tolist())
     return res
 
 

@@ -28,7 +28,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from music_common import (Logger, ShardedSampler, TypeStats, WindowDataset, add_model_args, assert_grammar,
                           build_model, cfg_from_args, concat_songs, count_params, evaluate, flatten_summary,
-                          format_position_curve, format_position_curve_by_type, format_summary, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
+                          format_pitch_diag, format_position_curve, format_position_curve_by_type, format_summary,
+                          format_tolerance, init_dist, load_or_build_maestro_cache, load_weights, lr_at,
                           make_optimizer, masked_ce, save_atomic)
 
 
@@ -47,6 +48,8 @@ def parse_args():
     p.add_argument("--score_from", type=int, default=0, help="evaluation only: count positions >= this index "
                    "(multiple of 3). Use with --eval_hop = seq_len - score_from so each token is scored once with "
                    ">= score_from tokens of context, e.g. --seq_len 768 --score_from 384 --eval_hop 384")
+    p.add_argument("--tols", type=str, default="", help="evaluation: tolerance-accuracy levels in ticks for "
+                   "time_shift/duration, e.g. 0,1,2,3 (1 tick = 31.25 ms). Reported IN ADDITION to exact accuracy.")
     p.add_argument("--transpose", type=int, default=5)
     p.add_argument("--time_stretch", action="store_true",
                    help="augmentation: random time stretch in {0.95,0.975,1,1.025,1.05} (MAESTRO-paper recipe)")
@@ -61,12 +64,6 @@ def parse_args():
     p.add_argument("--clip", type=float, default=0.5)
     p.add_argument("--contrastive_weight", type=float, default=0.0, help="optional CPC aux loss (0 = off)")
     p.add_argument("--cpc_ks", type=str, default="3,6")
-    # [CHANGED] tolerance metric / pitch-focused objective
-    p.add_argument("--time_tol", type=int, default=3,
-                   help="shift/duration count as correct within +-this many ticks (1 tick = 1/32 s; 3 ~ 94 ms). 0 = exact")
-    p.add_argument("--pitch_w", type=float, default=1.0, help="loss weight on pitch targets")
-    p.add_argument("--tol_loss", action="store_true",
-                   help="train shift/duration with -log P(within +-time_tol ticks) instead of exact-tick CE")
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--resume", action="store_true")
@@ -82,12 +79,9 @@ def parse_args():
 
 def main_worker(rank, world, args):
     init_dist(rank, world)
-    import music_common as mc                        # [CHANGED] pass the tolerance settings into music_common
-    mc.TIME_TOL, mc.PITCH_W, mc.TOL_LOSS = args.time_tol, args.pitch_w, args.tol_loss
-    if rank == 0:
-        print(f"time_tol={mc.TIME_TOL} ticks, pitch_w={mc.PITCH_W}, tol_loss={mc.TOL_LOSS}", flush=True)
     device = torch.device(f"cuda:{rank}")
     is_main = rank == 0
+    tols = tuple(int(t) for t in args.tols.split(",")) if args.tols else ()
     out_dir = pathlib.Path(args.out_dir)
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,12 +135,13 @@ def main_worker(rank, world, args):
     last_path = out_dir / f"finetune_last_{args.tag}.pt"
     st = dict(epoch=0, step=0, best=float("inf"), bad=0, wandb_id=None)
     if args.eval_only:        # e.g. --eval_only --init_ckpt artifacts/best_maestro_aria_init.pt
-        v = evaluate(raw, val_loader, device, args.score_from)
-        t = evaluate(raw, test_loader, device, args.score_from)
+        v = evaluate(raw, val_loader, device, args.score_from, tols)
+        t = evaluate(raw, test_loader, device, args.score_from, tols)
         if is_main:
+            extra = lambda r: (("\n" + format_tolerance(r)) if tols else "") + "\n" + format_pitch_diag(r)
             print(f"[eval_only] weights from {args.init_ckpt} | seq_len {args.seq_len}\n"
-                  f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n{format_position_curve_by_type(v)}\n"
-                  f"TEST {format_summary(t)}\n{format_position_curve(t)}\n{format_position_curve_by_type(t)}",
+                  f"VAL  {format_summary(v)}\n{format_position_curve(v)}\n{format_position_curve_by_type(v)}{extra(v)}\n"
+                  f"TEST {format_summary(t)}\n{format_position_curve(t)}\n{format_position_curve_by_type(t)}{extra(t)}",
                   flush=True)
         dist.barrier()
         dist.destroy_process_group()
@@ -229,10 +224,9 @@ def main_worker(rank, world, args):
                 d["train/aux_nce"] = aux_sum / max(aux_n, 1)
             logger.log(d, step=epoch + 1)
 
-        score = -val["types"]["pitch"]["acc"]            # [CHANGED] pick the best epoch by VAL PITCH ACCURACY
-        improved = score < st["best"]
+        improved = val["nll"] < st["best"]
         if improved:
-            st["best"], st["bad"] = score, 0
+            st["best"], st["bad"] = val["nll"], 0
             if is_main:
                 save_atomic({"model_state_dict": raw.state_dict(), "model_cfg": cfg,
                              "meta": dict(epoch=epoch + 1, val_ppl=val["ppl"], val_acc=val["acc"], tag=args.tag)},
