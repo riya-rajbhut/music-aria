@@ -36,9 +36,15 @@ ap.add_argument("--perplexity", type=float, default=30.0, help="for the hidden-s
 ap.add_argument("--out_dir", default="tsne_out")
 ap.add_argument("--maestro_dir", default="data")
 ap.add_argument("--seed", type=int, default=53)
+ap.add_argument("--threads", type=int, default=4, help="CPU threads for t-SNE/PCA (keep at the real core count)")
+ap.add_argument("--reuse", action="store_true", help="reuse saved hidden-vector files instead of running the model again")
 args = ap.parse_args()
+for _k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_k] = str(args.threads)          # must be set before numpy / scikit-learn are imported
 if args.canon:
     os.environ["CANON_CHORDS"] = "1"
+
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -53,6 +59,7 @@ from torch.amp import autocast
 
 from music_common import WindowDataset, build_model, concat_songs, load_or_build_maestro_cache, load_weights
 
+torch.set_num_threads(args.threads)
 os.makedirs(args.out_dir, exist_ok=True)
 dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -71,12 +78,16 @@ def run_tsne(X, perplexity):
     if X.shape[1] > 50 and X.shape[0] > 50:
         X = PCA(n_components=50, random_state=args.seed).fit_transform(X)
     kw = dict(n_components=2, perplexity=min(perplexity, (len(X) - 1) / 3.0), init="pca",
-              learning_rate="auto", random_state=args.seed)
+              learning_rate="auto", random_state=args.seed, n_jobs=args.threads, verbose=1)
+    t0 = time.time()
+    print(f"t-SNE on {len(X)} points ...", flush=True)
     try:
         ts = TSNE(max_iter=1000, **kw)
     except TypeError:                                   # older scikit-learn
         ts = TSNE(n_iter=1000, **kw)
-    return ts.fit_transform(X)
+    out = ts.fit_transform(X)
+    print(f"t-SNE done in {time.time() - t0:.0f} s", flush=True)
+    return out
 
 
 def pc_legend(ax):
@@ -119,7 +130,11 @@ def embeddings_figure():
     print(f"saved {path}", flush=True)
 
 
-def hidden_figure():
+def layer_tag():
+    return 'final' if args.layer < 0 else f'block{args.layer}'
+
+
+def collect_hidden():
     cap = {}
     target = model.ln_f if args.layer < 0 else model.blocks[args.layer]
     hook = target.register_forward_hook(lambda m, i, o: cap.__setitem__("h", o))
@@ -150,6 +165,19 @@ def hidden_figure():
     H, T, PR, CF = (torch.cat(v).numpy() for v in (H, T, PR, CF))
     print(f"{len(H)} hidden vectors | layer {'final' if args.layer < 0 else args.layer} | "
           f"accuracy of these points {np.mean(PR == T) * 100:.1f}%", flush=True)
+    return H, T, PR, CF
+
+
+def hidden_figure():
+    feat = os.path.join(args.out_dir, f"hidden_feats_{layer_tag()}.npz")
+    if args.reuse and os.path.exists(feat):
+        z = np.load(feat)
+        H, T, PR, CF = z["H"], z["T"], z["PR"], z["CF"]
+        print(f"reused {feat} ({len(H)} vectors)", flush=True)
+    else:
+        H, T, PR, CF = collect_hidden()
+        np.savez(feat, H=H, T=T, PR=PR, CF=CF)
+        print(f"saved {feat}", flush=True)
     xy = run_tsne(H, args.perplexity)
 
     fig, ax = plt.subplots(2, 2, figsize=(14, 12))
@@ -177,7 +205,7 @@ def hidden_figure():
     print(f"saved {path}", flush=True)
 
 
-def instances_figure():
+def collect_instances():
     cap = {}
     target = model.ln_f if args.layer < 0 else model.blocks[args.layer]
     hook = target.register_forward_hook(lambda m, i, o: cap.__setitem__("h", o))
@@ -212,6 +240,20 @@ def instances_figure():
     short = [p for p, c in count.items() if c < args.per_pitch]
     print(f"{len(H)} instances of {len(np.unique(L))} pitches | layer {'final' if args.layer < 0 else args.layer} | "
           f"{len(short)} rare pitches have fewer than {args.per_pitch} instances", flush=True)
+    return H, L
+
+
+def instances_figure():
+    feat = os.path.join(args.out_dir, f"instance_feats_{layer_tag()}.npz")
+    if args.reuse and os.path.exists(feat):
+        z = np.load(feat)
+        H, L = z["H"], z["L"]
+        print(f"reused {feat} ({len(H)} vectors)", flush=True)
+    else:
+        H, L = collect_instances()
+        np.savez(feat, H=H, L=L)
+        print(f"saved {feat}", flush=True)
+    pitches = np.arange(21, 109)
     xy = run_tsne(H, args.perplexity)
 
     fig, ax = plt.subplots(1, 2, figsize=(15, 7.5))
