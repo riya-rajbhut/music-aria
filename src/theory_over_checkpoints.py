@@ -14,7 +14,10 @@ and, for every checkpoint, measures
   with --with_keys (needs MAESTRO and a GPU; about a minute per checkpoint)
     - key awareness: correlation between the model's key-relative next-pitch-class distribution and the
       Krumhansl-Kessler profiles (major and minor)
-    - error structure: excess share of minor-third and tritone errors over what unrelated guesses would give
+    - error structure: excess share of minor-third and tritone errors over what unrelated guesses would give,
+      and (as in theory_compare.py) the share of each interval class 1..6 against two data baselines -- guesses
+      drawn from the context's pitch classes and from the last 8 notes -- with bootstrap 95% intervals over windows
+    --split test runs the key and error tests on MAESTRO test instead of validation
     - pitch accuracy on the scored notes (second half of each window)
 
 Outputs in --out_dir:  theory_over_checkpoints.png (lines), theory_ckpt_matrices.png (similarity matrix per checkpoint),
@@ -72,22 +75,84 @@ def prediction_metrics(st):
     out["minor3_excess"] = float((obs[3] + obs[9] - exp[3] - exp[9]) * 100)
     out["tritone_excess"] = float((obs[6] - exp[6]) * 100)
     out["pitch_acc"] = float(1 - st["err_int"].sum() / st["n_notes"]) * 100
+    out["n_scored_notes"] = int(st["n_notes"])
+    for i in range(12):                                                   # all intervals, "unrelated guess" baseline
+        out[f"err_i{i}_obs"], out[f"err_i{i}_exp"] = float(obs[i] * 100), float(exp[i] * 100)
+    out.update(error_baseline_summary(st))
     return out
 
 
-def collect_model_stats(model, songs, dev, min_corr):
+# ------------------------------------------------------------------------------------------------ error baselines
+IC = np.array([min(i, 12 - i) for i in range(12)])                   # interval (mod 12) -> interval class 0..6
+RECENT = 8                                                           # notes in the "recent notes" baseline
+
+
+def error_baselines(st, ctx, tgt, pred, wrong, seq, off):
+    """Same test as theory_compare.py. Wrong guesses whose pitch class differs from the true one, by interval class
+    1..6 (both directions merged), against two data baselines: a guess drawn from the pitch classes of the context
+    (first 128 notes of the window) or of the RECENT notes just before the scored note. Baselines exclude the true
+    pitch class and are renormalised per note; notes whose baseline would be empty are dropped from all three.
+    seq (B,L) = pitch classes of the window's notes; scored note n is seq[:, off + n]."""
+    t = (tgt % 12).cpu().numpy()
+    g = (pred % 12).cpu().numpy()
+    use = wrong.cpu().numpy() & (g != t)                                              # (B,N)
+    B, N = t.shape
+    roll = (t[..., None] + np.arange(12)) % 12                                        # pitch class at interval i above truth
+    Hc = np.stack([np.bincount(r, minlength=12) for r in ctx]).astype(float)          # (B,12)
+    base_c = np.take_along_axis(np.repeat(Hc[:, None], N, 1), roll, 2)                # (B,N,12) by interval
+    oh = np.eye(12)[seq]                                                              # (B,L,12)
+    cs = np.concatenate([np.zeros((B, 1, 12)), oh.cumsum(1)], 1)
+    idx = off + np.arange(N)
+    Hr = cs[:, idx] - cs[:, idx - RECENT]                                             # (B,N,12) last RECENT notes
+    base_r = np.take_along_axis(Hr, roll, 2)
+    for base in (base_c, base_r):
+        base[..., 0] = 0.0                                                            # a different pitch class only
+    tot_c, tot_r = base_c.sum(-1), base_r.sum(-1)
+    use &= (tot_c > 0) & (tot_r > 0)
+    fold = np.zeros((12, 7)); fold[np.arange(12), IC] = 1.0
+    obs = np.zeros((B, N, 12)); np.put_along_axis(obs, ((g - t) % 12)[..., None], 1.0, 2)
+    m = use[..., None]
+    st["ic_obs"].append(((obs * m).sum(1)) @ fold)
+    st["ic_ctx"].append(((base_c / np.maximum(tot_c, 1e-12)[..., None] * m).sum(1)) @ fold)
+    st["ic_rec"].append(((base_r / np.maximum(tot_r, 1e-12)[..., None] * m).sum(1)) @ fold)
+
+
+def error_baseline_summary(st, n_boot=2000, seed=53):
+    """observed and baseline shares (%) per interval class, and bootstrap 95% intervals (over windows) of the
+    differences observed - baseline. Column names match theory_compare.py."""
+    out = {}
+    if not st["ic_obs"]:
+        return out
+    O, C, R = (np.concatenate(st[k]) for k in ("ic_obs", "ic_ctx", "ic_rec"))           # (windows, 7)
+    n = O.sum()
+    out["err_n_other_pc"] = int(n)
+    boot = np.random.default_rng(seed).integers(0, len(O), size=(n_boot, len(O)))
+    so, sc, sr = (100 * A.sum(0) / max(n, 1e-12) for A in (O, C, R))
+    bo = np.stack([100 * O[b].sum(0) / O[b].sum() for b in boot])
+    bc = np.stack([100 * C[b].sum(0) / O[b].sum() for b in boot])
+    br = np.stack([100 * R[b].sum(0) / O[b].sum() for b in boot])
+    for ic in range(1, 7):
+        out[f"err_ic{ic}_obs"], out[f"err_ic{ic}_ctx"], out[f"err_ic{ic}_rec"] = float(so[ic]), float(sc[ic]), float(sr[ic])
+        for tag, bb in (("ctx", bc), ("rec", br)):
+            lo, hi = np.percentile(bo[:, ic] - bb[:, ic], [2.5, 97.5])
+            out[f"err_ic{ic}_d{tag}_lo"], out[f"err_ic{ic}_d{tag}_hi"] = float(lo), float(hi)
+    return out
+
+
+def collect_model_stats(model, songs, dev, min_corr, split="validation"):
     import torch
     import torch.utils.data as data
     from torch.amp import autocast
     from music_common import WindowDataset, concat_songs
-    tok, off = concat_songs(songs["validation"])
+    tok, off = concat_songs(songs[split])
     ds = WindowDataset(tok, off, np.arange(len(off) - 1), 768, 384)
     loader = data.DataLoader(ds, batch_size=32, num_workers=2)
     N0 = 128
     M = torch.zeros(128, 12, device=dev)
     M[torch.arange(128), torch.arange(128) % 12] = 1.0
     st = dict(rel_pred=np.zeros((2, 12)), rel_true=np.zeros((2, 12)), rel_notes=np.zeros(2), rel_windows=np.zeros(2, int),
-              err_int=np.zeros(12), err_true_pc=np.zeros(12), err_pred_pc=np.zeros(12), n_notes=0)
+              err_int=np.zeros(12), err_true_pc=np.zeros(12), err_pred_pc=np.zeros(12), n_notes=0,
+              ic_obs=[], ic_ctx=[], ic_rec=[])
     with torch.no_grad():
         for x, y, a in loader:
             x, y, a = x.to(dev), y.to(dev), a.to(dev)
@@ -103,6 +168,8 @@ def collect_model_stats(model, songs, dev, min_corr):
             st["err_true_pc"] += np.bincount((tgt % 12)[wrong].cpu().numpy(), minlength=12)
             st["err_pred_pc"] += np.bincount((pred % 12)[wrong].cpu().numpy(), minlength=12)
             ctx = (x[:, 1::3][:, :N0] % 12).cpu().numpy()
+            # x[:, 1::3] are the window's pitch tokens and y[:, 0::3] == x[:, 1::3], so scored note n is seq[:, N0 + n]
+            error_baselines(st, ctx, tgt, pred, wrong, (x[:, 1::3] % 12).cpu().numpy(), N0)
             hist = np.stack([np.bincount(r, minlength=12) for r in ctx])
             tonic, mode, corr = estimate_keys(hist)
             keep = corr >= min_corr
@@ -161,8 +228,14 @@ def plot_lines(res, runs, with_keys, path):
         a = ax[1, 1]
         a.plot(x, [r["minor3_excess"] for r in res], "o-", color=blue, label="minor-third errors")
         a.plot(x, [r["tritone_excess"] for r in res], "o-", color=orange, label="tritone errors")
+        if "err_ic3_obs" in res[0]:
+            d = [r["err_ic3_obs"] - r["err_ic3_rec"] for r in res]
+            lo = [r["err_ic3_drec_lo"] for r in res]
+            hi = [r["err_ic3_drec_hi"] for r in res]
+            a.errorbar(x, d, yerr=[np.subtract(d, lo), np.subtract(hi, d)], fmt="s--", color="tab:green",
+                       capsize=3, label="minor-third errors vs last 8 notes (95% CI)")
         a.axhline(0, color="grey", lw=0.5)
-        a.set_title("Error share above chance (points)")
+        a.set_title("Error share above baseline (points)")
         a = ax[1, 2]
         a.plot(x, [r["pitch_acc"] for r in res], "o-", color=blue, label="pitch accuracy")
         a.set_title("Pitch accuracy (%), not comparable across the dashed line")
@@ -234,6 +307,8 @@ def main():
     ap.add_argument("--out_dir", default="theory_ckpt")
     ap.add_argument("--maestro_dir", default="data")
     ap.add_argument("--with_keys", action="store_true", help="also run the model on MAESTRO validation (key and error tests)")
+    ap.add_argument("--split", choices=["validation", "test"], default="validation",
+                    help="MAESTRO split for the key and error tests (theory_compare.py uses each model's test split)")
     ap.add_argument("--min_corr", type=float, default=0.7)
     ap.add_argument("--n_perm", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=53)
@@ -269,11 +344,14 @@ def main():
         X_oct = np.stack([W[pitches[pitches % 12 == c]].mean(0) for c in range(12)])
         row = embedding_metrics(X_pc, X_oct, args.n_perm, args.seed)
         if args.with_keys:
-            row.update(prediction_metrics(collect_model_stats(model, get_songs(bool(r["canon"])), dev, args.min_corr)))
+            row.update(prediction_metrics(collect_model_stats(model, get_songs(bool(r["canon"])), dev, args.min_corr,
+                                                              args.split)))
         res.append(row)
         print(f"{r['label']:>22s} | fifths {row['pc_fifths']:+.2f} (p {row['pc_p_fifths']:.3f}) | "
               f"chromatic {row['pc_chrom']:+.2f} (p {row['pc_p_chrom']:.3f})"
               + (f" | r(K-K) major {row['r_kk_major']:.2f} minor {row['r_kk_minor']:.2f} | acc {row['pitch_acc']:.1f}%"
+                 + (f" | minor 3rd vs last 8 notes {row['err_ic3_obs'] - row['err_ic3_rec']:+.1f} "
+                    f"[{row['err_ic3_drec_lo']:+.1f}, {row['err_ic3_drec_hi']:+.1f}]" if "err_ic3_obs" in row else "")
                  if args.with_keys else ""), flush=True)
         del model, ck
         if dev.type == "cuda":
