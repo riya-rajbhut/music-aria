@@ -48,6 +48,9 @@ def embedding_metrics(X_pc, X_oct, n_perm, seed):
         out.update({f"{tag}_fifths": -s["rho5"], f"{tag}_chrom": -s["rho1"], f"{tag}_p_fifths": s["p_rho5"],
                     f"{tag}_p_chrom": s["p_rho1"], f"{tag}_k5": s["shares"][4] * 100, f"{tag}_k1": s["shares"][0] * 100,
                     f"{tag}_p_k5": s["p_share"][4], f"{tag}_p_k1": s["p_share"][0]})
+        for k in (2, 3, 4, 6):                   # all six Fourier components (k = 1 and 5 above)
+            out[f"{tag}_k{k}"] = s["shares"][k - 1] * 100
+            out[f"{tag}_p_k{k}"] = s["p_share"][k - 1]
         if tag == "pc":
             U, S, _ = np.linalg.svd(s["Xc"], full_matrices=False)
             out["_C"] = s["C"]
